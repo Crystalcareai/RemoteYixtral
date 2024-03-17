@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" Yixtral model configuration"""
+""" Mixtral model configuration"""
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
@@ -20,24 +20,24 @@ from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 
-YIXTRAL_PRETRAINED_CONFIG_ARCHIVE_MAP = {
+MIXTRAL_PRETRAINED_CONFIG_ARCHIVE_MAP = {
     "Crystalcareai/Yixtral-Test": "https://huggingface.co/Crystalcareai/Yixtral-Test/resolve/main/config.json",
 }
 
 
-class YixtralConfig(PretrainedConfig):
+class MixtralConfig(PretrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a [`YixtralModel`]. It is used to instantiate a Yixtral
+    This is the configuration class to store the configuration of a [`MixtralModel`]. It is used to instantiate a Mixtral
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
-    defaults will yield a similar configuration to that of the Yixtral-Test.
+    defaults will yield a similar configuration to that of the Mixtral-Test.
 
     Configuration objects inherit from [`PretrainedConfig`] and can be used to control the model outputs. Read the
     documentation from [`PretrainedConfig`] for more information.
 
     Args:
         vocab_size (`int`, *optional*, defaults to 64000):
-            Vocabulary size of the Yixtral model. Defines the number of different tokens that can be represented by the
-            `inputs_ids` passed when calling [`YixtralModel`]
+            Vocabulary size of the Mixtral model. Defines the number of different tokens that can be represented by the
+            `inputs_ids` passed when calling [`MixtralModel`]
         hidden_size (`int`, *optional*, defaults to 4096):
             Dimension of the hidden representations.
         intermediate_size (`int`, *optional*, defaults to 11008):
@@ -85,19 +85,19 @@ class YixtralConfig(PretrainedConfig):
             Whether or not to output the logits of the routers.
 
     ```python
-    >>> from transformers import YixtralModel, YixtralConfig
+    >>> from transformers import MixtralModel, MixtralConfig
 
-    >>> # Initializing a Yixtral Yixtral-Test style configuration
-    >>> configuration = YixtralConfig() 
+    >>> # Initializing a Mixtral Mixtral-Test style configuration
+    >>> configuration = MixtralConfig() 
 
-    >>> # Initializing a model from the Yixtral-Test style configuration
-    >>> model = YixtralModel(configuration)
+    >>> # Initializing a model from the Mixtral-Test style configuration
+    >>> model = MixtralModel(configuration)
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```"""
 
-    model_type = "Yixtral"
+    model_type = "Mixtral"
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(

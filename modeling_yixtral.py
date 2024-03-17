@@ -29,7 +29,7 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from scattermoe.kernels.ops import flatten_and_sort, padded_block_indices, scatter2scatter
+from scattermoe.mlp import MLP
 
 
 from transformers.activations import ACT2FN
@@ -796,66 +796,32 @@ class YixtralSparseMoeBlock(nn.Module):
         self.ffn_dim = config.intermediate_size
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
-        self.act_fn = ACT2FN[config.hidden_act]
 
         # gating
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
 
-        self.w1 = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.ffn_dim))
-        self.w2 = nn.Parameter(torch.empty(self.num_experts, self.ffn_dim, self.hidden_dim))
-        self.w3 = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.ffn_dim))
-
-        self._reset_parameters()
-
-    def _reset_parameters(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
+        self.mlp = MLP(
+            input_size=self.hidden_dim,
+            hidden_size=self.ffn_dim,
+            activation=nn.GELU(),
+            num_experts=self.num_experts,
+            top_k=self.top_k
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        
         router_logits = self.gate(hidden_states)
-
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        top_k_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        top_k_weights /= top_k_weights.sum(dim=-1, keepdim=True)
-        top_k_weights = top_k_weights.to(hidden_states.dtype)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        routing_weights = routing_weights.to(hidden_states.dtype)
 
-        with torch.no_grad():
-            (sorted_expert_idxs, sorted_scattered_idxs) = flatten_and_sort(selected_experts)
-            (padded_block_idxs, expert_offsets) = padded_block_indices(sorted_expert_idxs, self.num_experts)
+        hidden_states = self.mlp(hidden_states, routing_weights, selected_experts)
+        hidden_states = hidden_states.reshape(batch_size, sequence_length, hidden_dim)
 
-        h = scatter2scatter(
-            X=hidden_states,
-            W=self.w1,
-            sorted_expert_idxs=sorted_expert_idxs,
-            sorted_scattered_idxs=sorted_scattered_idxs,
-            padded_block_idxs=padded_block_idxs,
-            k=self.top_k,
-        )
-
-        h = self.act_fn(h) * scatter2scatter(
-            X=hidden_states,
-            W=self.w3,
-            sorted_expert_idxs=sorted_expert_idxs,
-            sorted_scattered_idxs=sorted_scattered_idxs,
-            padded_block_idxs=padded_block_idxs,
-            k=self.top_k,
-        )
-
-        y = scatter2scatter(
-            X=h,
-            W=self.w2,
-            sorted_expert_idxs=sorted_expert_idxs,
-            sorted_scattered_idxs=sorted_scattered_idxs,
-            padded_block_idxs=padded_block_idxs,
-            k=1,
-            gates=top_k_weights,
-        )
-
-        final_hidden_states = y.view(batch_size, sequence_length, hidden_dim)
-        return final_hidden_states, router_logits
+        return hidden_states, router_logits
 
 class YixtralDecoderLayer(nn.Module):
     def __init__(self, config: YixtralConfig, layer_idx: int):

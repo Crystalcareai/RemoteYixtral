@@ -17,7 +17,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-""" PyTorch Yixtral model."""
+""" PyTorch Mixtral model."""
 import inspect
 import math
 import warnings
@@ -29,7 +29,7 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from scattermoe.mlp import MLP
+from scattermoe.kernels.ops import flatten_and_sort, padded_block_indices, scatter2scatter
 
 
 from transformers.activations import ACT2FN
@@ -54,7 +54,7 @@ from transformers.utils import (
     replace_return_docstrings,
 )
 from transformers.utils.import_utils import is_torch_fx_available
-from .configuration_yixtral import YixtralConfig
+from .configuration_mixtral import MixtralConfig
 
 
 if is_flash_attn_2_available():
@@ -74,7 +74,7 @@ if is_torch_fx_available():
 
 logger = logging.get_logger(__name__)
 
-_CONFIG_FOR_DOC = "YixtralConfig"
+_CONFIG_FOR_DOC = "MixtralConfig"
 
 
 def load_balancing_loss_func(
@@ -166,11 +166,11 @@ def _get_unpad_data(attention_mask):
     )
 
 
-# Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Yixtral
-class YixtralRMSNorm(nn.Module):
+# Copied from transformers.models.llama.modeling_llama.LlamaRMSNorm with Llama->Mixtral
+class MixtralRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
-        YixtralRMSNorm is equivalent to T5LayerNorm
+        MixtralRMSNorm is equivalent to T5LayerNorm
         """
         super().__init__()
         self.weight = nn.Parameter(torch.ones(hidden_size))
@@ -184,8 +184,8 @@ class YixtralRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
-# Copied from transformers.models.mistral.modeling_mistral.MistralRotaryEmbedding with Mistral->Yixtral
-class YixtralRotaryEmbedding(nn.Module):
+# Copied from transformers.models.mistral.modeling_mistral.MistralRotaryEmbedding with Mistral->Mixtral
+class MixtralRotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
 
@@ -271,14 +271,14 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-# Copied from transformers.models.mistral.modeling_mistral.MistralAttention with Mistral->Yixtral
-class YixtralAttention(nn.Module):
+# Copied from transformers.models.mistral.modeling_mistral.MistralAttention with Mistral->Mixtral
+class MixtralAttention(nn.Module):
     """
     Multi-headed attention from 'Attention Is All You Need' paper. Modified to use sliding window attention: Longformer
     and "Generating Long Sequences with Sparse Transformers".
     """
 
-    def __init__(self, config: YixtralConfig, layer_idx: Optional[int] = None):
+    def __init__(self, config: MixtralConfig, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -309,7 +309,7 @@ class YixtralAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
 
-        self.rotary_emb = YixtralRotaryEmbedding(
+        self.rotary_emb = MixtralRotaryEmbedding(
             self.head_dim,
             max_position_embeddings=self.max_position_embeddings,
             base=self.rope_theta,
@@ -400,10 +400,10 @@ class YixtralAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
-# Copied from transformers.models.mistral.modeling_mistral.MistralFlashAttention2 with Mistral->Yixtral
-class YixtralFlashAttention2(YixtralAttention):
+# Copied from transformers.models.mistral.modeling_mistral.MistralFlashAttention2 with Mistral->Mixtral
+class MixtralFlashAttention2(MixtralAttention):
     """
-    Yixtral flash attention module. This module inherits from `YixtralAttention` as the weights of the module stays
+    Mixtral flash attention module. This module inherits from `MixtralAttention` as the weights of the module stays
     untouched. The only required change would be on the forward pass where it needs to correctly call the public API of
     flash attention and deal with padding tokens in case the input contains any of them.
     """
@@ -695,15 +695,15 @@ class YixtralFlashAttention2(YixtralAttention):
         )
 
 
-# Copied from transformers.models.mistral.modeling_mistral.MistralSdpaAttention with Mistral->Yixtral
-class YixtralSdpaAttention(YixtralAttention):
+# Copied from transformers.models.mistral.modeling_mistral.MistralSdpaAttention with Mistral->Mixtral
+class MixtralSdpaAttention(MixtralAttention):
     """
-    Yixtral attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
-    `YixtralAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
+    Mixtral attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
+    `MixtralAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
     SDPA API.
     """
 
-    # Adapted from YixtralAttention.forward
+    # Adapted from MixtralAttention.forward
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -716,7 +716,7 @@ class YixtralSdpaAttention(YixtralAttention):
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
             logger.warning_once(
-                "YixtralModel is using YixtralSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+                "MixtralModel is using MixtralSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
                 'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
             )
             return super().forward(
@@ -783,56 +783,90 @@ class YixtralSdpaAttention(YixtralAttention):
         return attn_output, None, past_key_value
 
 
-YIXTRAL_ATTENTION_CLASSES = {
-    "eager": YixtralAttention,
-    "flash_attention_2": YixtralFlashAttention2,
-    "sdpa": YixtralSdpaAttention,
+MIXTRAL_ATTENTION_CLASSES = {
+    "eager": MixtralAttention,
+    "flash_attention_2": MixtralFlashAttention2,
+    "sdpa": MixtralSdpaAttention,
 }
 
-class YixtralSparseMoeBlock(nn.Module):
+class MixtralSparseMoeBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size
         self.num_experts = config.num_local_experts
         self.top_k = config.num_experts_per_tok
+        self.act_fn = ACT2FN[config.hidden_act]
 
         # gating
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
 
-        self.mlp = MLP(
-            input_size=self.hidden_dim,
-            hidden_size=self.ffn_dim,
-            activation=nn.GELU(),
-            num_experts=self.num_experts,
-            top_k=self.top_k
-        )
+        self.w1 = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.ffn_dim))
+        self.w2 = nn.Parameter(torch.empty(self.num_experts, self.ffn_dim, self.hidden_dim))
+        self.w3 = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.ffn_dim))
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        
         router_logits = self.gate(hidden_states)
+
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(hidden_states.dtype)
+        top_k_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        top_k_weights /= top_k_weights.sum(dim=-1, keepdim=True)
+        top_k_weights = top_k_weights.to(hidden_states.dtype)
 
-        hidden_states = self.mlp(hidden_states, routing_weights, selected_experts)
-        hidden_states = hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+        with torch.no_grad():
+            (sorted_expert_idxs, sorted_scattered_idxs) = flatten_and_sort(selected_experts)
+            (padded_block_idxs, expert_offsets) = padded_block_indices(sorted_expert_idxs, self.num_experts)
 
-        return hidden_states, router_logits
+        h = scatter2scatter(
+            X=hidden_states,
+            W=self.w1,
+            sorted_expert_idxs=sorted_expert_idxs,
+            sorted_scattered_idxs=sorted_scattered_idxs,
+            padded_block_idxs=padded_block_idxs,
+            k=self.top_k,
+        )
 
-class YixtralDecoderLayer(nn.Module):
-    def __init__(self, config: YixtralConfig, layer_idx: int):
+        h = self.act_fn(h) * scatter2scatter(
+            X=hidden_states,
+            W=self.w3,
+            sorted_expert_idxs=sorted_expert_idxs,
+            sorted_scattered_idxs=sorted_scattered_idxs,
+            padded_block_idxs=padded_block_idxs,
+            k=self.top_k,
+        )
+
+        y = scatter2scatter(
+            X=h,
+            W=self.w2,
+            sorted_expert_idxs=sorted_expert_idxs,
+            sorted_scattered_idxs=sorted_scattered_idxs,
+            padded_block_idxs=padded_block_idxs,
+            k=1,
+            gates=top_k_weights,
+        )
+
+        final_hidden_states = y.view(batch_size, sequence_length, hidden_dim)
+        return final_hidden_states, router_logits
+
+class MixtralDecoderLayer(nn.Module):
+    def __init__(self, config: MixtralConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = YIXTRAL_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
+        self.self_attn = MIXTRAL_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
 
-        self.block_sparse_moe = YixtralSparseMoeBlock(config)
-        self.input_layernorm = YixtralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = YixtralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.block_sparse_moe = MixtralSparseMoeBlock(config)
+        self.input_layernorm = MixtralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = MixtralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -901,7 +935,7 @@ class YixtralDecoderLayer(nn.Module):
         return outputs
 
 
-YIXTRAL_START_DOCSTRING = r"""
+MIXTRAL_START_DOCSTRING = r"""
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
     library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
     etc.)
@@ -911,7 +945,7 @@ YIXTRAL_START_DOCSTRING = r"""
     and behavior.
 
     Parameters:
-        config ([`YixtralConfig`]):
+        config ([`MixtralConfig`]):
             Model configuration class with all the parameters of the model. Initializing with a config file does not
             load the weights associated with the model, only the configuration. Check out the
             [`~PreTrainedModel.from_pretrained`] method to load the model weights.
@@ -919,15 +953,15 @@ YIXTRAL_START_DOCSTRING = r"""
 
 
 @add_start_docstrings(
-    "The bare Yixtral Model outputting raw hidden-states without any specific head on top.",
-    YIXTRAL_START_DOCSTRING,
+    "The bare Mixtral Model outputting raw hidden-states without any specific head on top.",
+    MIXTRAL_START_DOCSTRING,
 )
-# Copied from transformers.models.mistral.modeling_mistral.MistralPreTrainedModel with Mistral->Yixtral
-class YixtralPreTrainedModel(PreTrainedModel):
-    config_class = YixtralConfig
+# Copied from transformers.models.mistral.modeling_mistral.MistralPreTrainedModel with Mistral->Mixtral
+class MixtralPreTrainedModel(PreTrainedModel):
+    config_class = MixtralConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["YixtralDecoderLayer"]
+    _no_split_modules = ["MixtralDecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True
     _supports_sdpa = True
@@ -945,7 +979,7 @@ class YixtralPreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
 
 
-YIXTRAL_INPUTS_DOCSTRING = r"""
+MIXTRAL_INPUTS_DOCSTRING = r"""
     Args:
         input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
             Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
@@ -1013,29 +1047,29 @@ YIXTRAL_INPUTS_DOCSTRING = r"""
 
 
 @add_start_docstrings(
-    "The bare Yixtral Model outputting raw hidden-states without any specific head on top.",
-    YIXTRAL_START_DOCSTRING,
+    "The bare Mixtral Model outputting raw hidden-states without any specific head on top.",
+    MIXTRAL_START_DOCSTRING,
 )
-# Copied from transformers.models.mistral.modeling_mistral.MistralModel with MISTRAL->YIXTRAL,Mistral->Yixtral
-class YixtralModel(YixtralPreTrainedModel):
+# Copied from transformers.models.mistral.modeling_mistral.MistralModel with MISTRAL->MIXTRAL,Mistral->Mixtral
+class MixtralModel(MixtralPreTrainedModel):
     """
-    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`YixtralDecoderLayer`]
+    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`MixtralDecoderLayer`]
 
     Args:
-        config: YixtralConfig
+        config: MixtralConfig
     """
 
-    def __init__(self, config: YixtralConfig):
+    def __init__(self, config: MixtralConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [YixtralDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [MixtralDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self._attn_implementation = config._attn_implementation
-        self.norm = YixtralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = MixtralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
         # Initialize weights and apply final processing
@@ -1048,7 +1082,7 @@ class YixtralModel(YixtralPreTrainedModel):
         self.embed_tokens = value
 
     # Ignore copy
-    @add_start_docstrings_to_model_forward(YIXTRAL_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(MIXTRAL_INPUTS_DOCSTRING)
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1115,7 +1149,7 @@ class YixtralModel(YixtralPreTrainedModel):
             if is_padding_right:
                 raise ValueError(
                     "You are attempting to perform batched generation with padding_side='right'"
-                    " this may lead to unexpected behaviour for Flash Attention version of Yixtral. Make sure to "
+                    " this may lead to unexpected behaviour for Flash Attention version of Mixtral. Make sure to "
                     " call `tokenizer.padding_side  = 'left'` before tokenizing the input. "
                 )
 
@@ -1211,12 +1245,12 @@ class YixtralModel(YixtralPreTrainedModel):
         )
 
 
-class YixtralForCausalLM(YixtralPreTrainedModel):
+class MixtralForCausalLM(MixtralPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = YixtralModel(config)
+        self.model = MixtralModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.router_aux_loss_coef = config.router_aux_loss_coef
@@ -1243,7 +1277,7 @@ class YixtralForCausalLM(YixtralPreTrainedModel):
     def get_decoder(self):
         return self.model
 
-    @add_start_docstrings_to_model_forward(YIXTRAL_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(MIXTRAL_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=MoeCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     # Ignore copy
     def forward(
@@ -1272,10 +1306,10 @@ class YixtralForCausalLM(YixtralPreTrainedModel):
         Example:
 
         ```python
-        >>> from transformers import AutoTokenizer, YixtralForCausalLM
+        >>> from transformers import AutoTokenizer, MixtralForCausalLM
 
-        >>> model = YixtralForCausalLM.from_pretrained("mistralai/Yixtral-8x7B-v0.1")
-        >>> tokenizer = AutoTokenizer.from_pretrained("mistralai/Yixtral-8x7B-v0.1")
+        >>> model = MixtralForCausalLM.from_pretrained("mistralai/Mixtral-8x7B-v0.1")
+        >>> tokenizer = AutoTokenizer.from_pretrained("mistralai/Mixtral-8x7B-v0.1")
 
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
         >>> inputs = tokenizer(prompt, return_tensors="pt")
@@ -1430,9 +1464,9 @@ class YixtralForCausalLM(YixtralPreTrainedModel):
 
 @add_start_docstrings(
     """
-    The Yixtral Model transformer with a sequence classification head on top (linear layer).
+    The Mixtral Model transformer with a sequence classification head on top (linear layer).
 
-    [`YixtralForSequenceClassification`] uses the last token in order to do the classification, as other causal models
+    [`MixtralForSequenceClassification`] uses the last token in order to do the classification, as other causal models
     (e.g. GPT-2) do.
 
     Since it does classification on the last token, it requires to know the position of the last token. If a
@@ -1441,14 +1475,14 @@ class YixtralForCausalLM(YixtralPreTrainedModel):
     padding tokens when `inputs_embeds` are passed instead of `input_ids`, it does the same (take the last value in
     each row of the batch).
     """,
-    YIXTRAL_START_DOCSTRING,
+    MIXTRAL_START_DOCSTRING,
 )
-# Copied from transformers.models.llama.modeling_llama.LlamaForSequenceClassification with Llama->Yixtral, LLAMA->YIXTRAL
-class YixtralForSequenceClassification(YixtralPreTrainedModel):
+# Copied from transformers.models.llama.modeling_llama.LlamaForSequenceClassification with Llama->Mixtral, LLAMA->MIXTRAL
+class MixtralForSequenceClassification(MixtralPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
-        self.model = YixtralModel(config)
+        self.model = MixtralModel(config)
         self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
 
         # Initialize weights and apply final processing
@@ -1460,7 +1494,7 @@ class YixtralForSequenceClassification(YixtralPreTrainedModel):
     def set_input_embeddings(self, value):
         self.model.embed_tokens = value
 
-    @add_start_docstrings_to_model_forward(YIXTRAL_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(MIXTRAL_INPUTS_DOCSTRING)
     def forward(
         self,
         input_ids: torch.LongTensor = None,

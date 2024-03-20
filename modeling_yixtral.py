@@ -53,9 +53,6 @@ from transformers.utils import (
 from transformers.utils.import_utils import is_torch_fx_available
 from .configuration_yixtral import YixtralConfig
 
-from megablocks.layers.dmoe import ParallelDroplessMLP
-from megablocks.layers.arguments import Arguments
-
 import scattermoe
 
 if is_flash_attn_2_available():
@@ -696,59 +693,6 @@ class YixtralSparseMoeBlock(nn.Module):
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
         final_hidden_states = self.moe_mlp(hidden_states, routing_weights, selected_experts)
-        final_hidden_states = final_hidden_states.view(batch_size, sequence_length, hidden_dim)
-        return final_hidden_states, router_logits
-
-class MegablocksYixtralSparseMoeBlock(nn.Module):
-    """
-    This implementation is
-    strictly equivalent to standard MoE with full capacity (no
-    dropped tokens). It's faster since it formulates MoE operations
-    in terms of block-sparse operations to accomodate imbalanced
-    assignments of tokens to experts, whereas standard MoE either
-    (1) drop tokens at the cost of reduced performance or (2) set
-    capacity factor to number of experts and thus waste computation
-    and memory on padding.
-    """
-
-    def __init__(self, config):
-        super().__init__()
-        self.hidden_dim = config.hidden_size
-        self.ffn_dim = config.intermediate_size
-        self.num_experts = config.num_local_experts
-        self.top_k = config.num_experts_per_tok
-
-        # gating
-        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
-
-
-        self.moe_mlp = ParallelDroplessMLP(Arguments(
-            hidden_size=self.hidden_dim,
-            ffn_hidden_size=self.ffn_dim,
-            moe_num_experts=self.num_experts,
-            moe_top_k=self.top_k,
-            moe_capacity_factor=1,
-            # init_method=partial(torch.nn.init.normal_, mean=0.0, std=0.1),
-            mlp_type='glu',
-            mlp_impl='sparse',
-            fp16=False,
-            bf16=False,
-            bias=False
-        ))
-
-    def forward(self, hidden_states: torch.Tensor):
-        """ """
-        batch_size, sequence_length, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
-        # router_logits: (batch * sequence_length, n_experts)
-        router_logits = self.gate(hidden_states)
-
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-        # we cast back to the input dtype
-        routing_weights = routing_weights.to(hidden_states.dtype)
-        final_hidden_states = self.moe_mlp(hidden_states, router_logits, routing_weights,  selected_experts)
         final_hidden_states = final_hidden_states.view(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
 

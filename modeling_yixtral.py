@@ -29,20 +29,17 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from scattermoe.mlp import MLP
-
-
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask,
-    _prepare_4d_causal_attention_mask_for_sdpa,
 )
 from transformers.modeling_outputs import (
     MoeCausalLMOutputWithPast,
     MoeModelOutputWithPast,
     SequenceClassifierOutputWithPast,
 )
+
 from transformers.modeling_utils import PreTrainedModel
 from transformers.pytorch_utils import is_torch_greater_or_equal_than_1_13
 from transformers.utils import (
@@ -56,12 +53,19 @@ from transformers.utils import (
 from transformers.utils.import_utils import is_torch_fx_available
 from .configuration_yixtral import YixtralConfig
 
+from megablocks.layers.dmoe import ParallelDroplessMLP
+from megablocks.layers.arguments import Arguments
+
+import scattermoe
 
 if is_flash_attn_2_available():
+    print("USING FLASH ATTN")
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
     _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
+else:
+    print("USing nive attention")
 
 # This makes `_prepare_4d_causal_attention_mask` a leaf function in the FX graph.
 # It means that the function will not be traced through and simply appear as a node in the graph.
@@ -77,9 +81,7 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "YixtralConfig"
 
 
-def load_balancing_loss_func(
-    gate_logits: torch.Tensor, num_experts: torch.Tensor = None, top_k=2, attention_mask: Optional[torch.Tensor] = None
-) -> float:
+def load_balancing_loss_func(gate_logits: torch.Tensor, num_experts: torch.Tensor = None, top_k=2) -> float:
     r"""
     Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
 
@@ -89,68 +91,41 @@ def load_balancing_loss_func(
 
     Args:
         gate_logits (Union[`torch.Tensor`, Tuple[torch.Tensor]):
-            Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
-            shape [batch_size X sequence_length, num_experts].
-        attention_mask (`torch.Tensor`, None):
-            The attention_mask used in forward function
-            shape [batch_size X sequence_length] if not None.
+            Logits from the `gate`, should be a tuple of tensors. Shape: [batch_size, seqeunce_length, num_experts].
         num_experts (`int`, *optional*):
             Number of experts
 
     Returns:
         The auxiliary loss.
     """
-    if gate_logits is None or not isinstance(gate_logits, tuple):
+    if gate_logits is None:
         return 0
 
     if isinstance(gate_logits, tuple):
-        compute_device = gate_logits[0].device
-        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
+        # cat along the layers?
+        gate_logits = torch.cat(gate_logits, dim=0)
 
-    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+    routing_weights, selected_experts = torch.topk(gate_logits, top_k, dim=-1)
+    routing_weights = routing_weights.softmax(dim=-1)
 
-    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    # cast the expert indices to int64, otherwise one-hot encoding will fail
+    if selected_experts.dtype != torch.int64:
+        selected_experts = selected_experts.to(torch.int64)
+
+    if len(selected_experts.shape) == 2:
+        selected_experts = selected_experts.unsqueeze(2)
 
     expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
 
-    if attention_mask is None:
-        # Compute the percentage of tokens routed to each experts
-        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+    # For a given token, determine if it was routed to a given expert.
+    expert_mask = torch.max(expert_mask, axis=-2).values
 
-        # Compute the average probability of routing to these experts
-        router_prob_per_expert = torch.mean(routing_weights, dim=0)
-    else:
-        batch_size, sequence_length = attention_mask.shape
-        num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
+    # cast to float32 otherwise mean will fail
+    expert_mask = expert_mask.to(torch.float32)
+    tokens_per_group_and_expert = torch.mean(expert_mask, axis=-2)
 
-        # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
-        expert_attention_mask = (
-            attention_mask[None, :, :, None, None]
-            .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
-            .reshape(-1, top_k, num_experts)
-            .to(compute_device)
-        )
-
-        # Compute the percentage of tokens routed to each experts
-        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
-            expert_attention_mask, dim=0
-        )
-
-        # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
-        router_per_expert_attention_mask = (
-            attention_mask[None, :, :, None]
-            .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
-            .reshape(-1, num_experts)
-            .to(compute_device)
-        )
-
-        # Compute the average probability of routing to these experts
-        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
-            router_per_expert_attention_mask, dim=0
-        )
-
-    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
-    return overall_loss * num_experts
+    router_prob_per_group_and_expert = torch.mean(routing_weights, axis=-1)
+    return torch.mean(tokens_per_group_and_expert * router_prob_per_group_and_expert.unsqueeze(-1)) * (num_experts**2)
 
 
 # Copied from transformers.models.llama.modeling_llama._get_unpad_data
@@ -158,7 +133,7 @@ def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
     max_seqlen_in_batch = seqlens_in_batch.max().item()
-    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
+    cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.torch.int32), (1, 0))
     return (
         indices,
         cu_seqlens,
@@ -184,7 +159,7 @@ class YixtralRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
-# Copied from transformers.models.mistral.modeling_mistral.MistralRotaryEmbedding with Mistral->Yixtral
+# Copied from transformers.models.llama.modeling_llama.LlamaRotaryEmbedding with Llama->Yixtral
 class YixtralRotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
@@ -192,7 +167,7 @@ class YixtralRotaryEmbedding(nn.Module):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, dtype=torch.int64).float().to(device) / self.dim))
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         # Build here to make `torch.jit.trace` work.
@@ -202,7 +177,7 @@ class YixtralRotaryEmbedding(nn.Module):
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=torch.int64).type_as(self.inv_freq)
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
 
         freqs = torch.outer(t, self.inv_freq)
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
@@ -229,7 +204,7 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-# Copied from transformers.models.mistral.modeling_mistral.apply_rotary_pos_emb
+# Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
 
@@ -284,8 +259,8 @@ class YixtralAttention(nn.Module):
         self.layer_idx = layer_idx
         if layer_idx is None:
             logger.warning_once(
-                f"Instantiating {self.__class__.__name__} without passing a `layer_idx` is not recommended and will "
-                "lead to errors during the forward call if caching is used. Please make sure to provide a `layer_idx` "
+                f"Instantiating {self.__class__.__name__} without passing `layer_idx` is not recommended and will "
+                "to errors during the forward call, if caching is used. Please make sure to provide a `layer_idx` "
                 "when creating this class."
             )
 
@@ -446,12 +421,6 @@ class YixtralFlashAttention2(YixtralAttention):
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
-            if self.layer_idx is None:
-                raise ValueError(
-                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
-                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
-                    "with a layer index."
-                )
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
 
         # Because the input can be padded, the absolute sequence length depends on the max position id.
@@ -474,16 +443,11 @@ class YixtralFlashAttention2(YixtralAttention):
 
         if past_key_value is not None:
             # Activate slicing cache only if the config has a value `sliding_windows` attribute
-            cache_has_contents = past_key_value.get_seq_length(self.layer_idx) > 0
-            if (
-                getattr(self.config, "sliding_window", None) is not None
-                and kv_seq_len > self.config.sliding_window
-                and cache_has_contents
-            ):
+            if getattr(self.config, "sliding_window", None) is not None and kv_seq_len > self.config.sliding_window:
                 slicing_tokens = 1 - self.config.sliding_window
 
-                past_key = past_key_value[self.layer_idx][0]
-                past_value = past_key_value[self.layer_idx][1]
+                past_key = past_key_value[0]
+                past_value = past_key_value[1]
 
                 past_key = past_key[:, :, slicing_tokens:, :].contiguous()
                 past_value = past_value[:, :, slicing_tokens:, :].contiguous()
@@ -493,6 +457,8 @@ class YixtralFlashAttention2(YixtralAttention):
                         f"past key must have a shape of (`batch_size, num_heads, self.config.sliding_window-1, head_dim`), got"
                         f" {past_key.shape}"
                     )
+
+                past_key_value = (past_key, past_value)
 
                 if attention_mask is not None:
                     attention_mask = attention_mask[:, slicing_tokens:]
@@ -511,10 +477,8 @@ class YixtralFlashAttention2(YixtralAttention):
         # cast them back in float16 just to be sure everything works as expected.
         input_dtype = query_states.dtype
         if input_dtype == torch.float32:
-            if torch.is_autocast_enabled():
-                target_dtype = torch.get_autocast_gpu_dtype()
             # Handle the case where the model is quantized
-            elif hasattr(self.config, "_pre_quantization_dtype"):
+            if hasattr(self.config, "_pre_quantization_dtype"):
                 target_dtype = self.config._pre_quantization_dtype
             else:
                 target_dtype = self.q_proj.weight.dtype
@@ -577,7 +541,7 @@ class YixtralFlashAttention2(YixtralAttention):
             attention_mask (`torch.Tensor`):
                 The padding mask - corresponds to a tensor of size `(batch_size, seq_len)` where 0 stands for the
                 position of padding tokens and 1 for the position of non-padding tokens.
-            dropout (`float`):
+            dropout (`int`, *optional*):
                 Attention dropout
             softmax_scale (`float`, *optional*):
                 The scaling of QK^T before applying softmax. Default to 1 / sqrt(head_dim)
@@ -695,98 +659,9 @@ class YixtralFlashAttention2(YixtralAttention):
         )
 
 
-# Copied from transformers.models.mistral.modeling_mistral.MistralSdpaAttention with Mistral->Yixtral
-class YixtralSdpaAttention(YixtralAttention):
-    """
-    Yixtral attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
-    `YixtralAttention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
-    SDPA API.
-    """
-
-    # Adapted from YixtralAttention.forward
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        if output_attentions:
-            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
-            logger.warning_once(
-                "YixtralModel is using YixtralSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
-                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-            )
-            return super().forward(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-            )
-
-        bsz, q_len, _ = hidden_states.size()
-
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
-
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
-        kv_seq_len = key_states.shape[-2]
-        if past_key_value is not None:
-            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-
-        if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-
-        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
-        # Reference: https://github.com/pytorch/pytorch/issues/112577.
-        if query_states.device.type == "cuda" and attention_mask is not None:
-            query_states = query_states.contiguous()
-            key_states = key_states.contiguous()
-            value_states = value_states.contiguous()
-
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=attention_mask,
-            dropout_p=self.attention_dropout if self.training else 0.0,
-            # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
-            is_causal=self.is_causal and attention_mask is None and q_len > 1,
-        )
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
-
-        attn_output = self.o_proj(attn_output)
-
-        return attn_output, None, past_key_value
-
-
-YIXTRAL_ATTENTION_CLASSES = {
+MISTRAL_ATTENTION_CLASSES = {
     "eager": YixtralAttention,
     "flash_attention_2": YixtralFlashAttention2,
-    "sdpa": YixtralSdpaAttention,
 }
 
 class YixtralSparseMoeBlock(nn.Module):
@@ -800,35 +675,90 @@ class YixtralSparseMoeBlock(nn.Module):
         # gating
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
 
-        self.mlp = MLP(
+        self.moe_mlp = scattermoe.mlp.GLUMLP(
             input_size=self.hidden_dim,
             hidden_size=self.ffn_dim,
-            activation=nn.GELU(),
             num_experts=self.num_experts,
-            top_k=self.top_k
+            top_k=self.top_k,
+            activation=ACT2FN[config.hidden_act]
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor):
+        """ """
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
-        
+        # router_logits: (batch * sequence_length, n_experts)
         router_logits = self.gate(hidden_states)
+
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
+        final_hidden_states = self.moe_mlp(hidden_states, routing_weights, selected_experts)
+        final_hidden_states = final_hidden_states.view(batch_size, sequence_length, hidden_dim)
+        return final_hidden_states, router_logits
 
-        hidden_states = self.mlp(hidden_states, routing_weights, selected_experts)
-        hidden_states = hidden_states.reshape(batch_size, sequence_length, hidden_dim)
+class MegablocksYixtralSparseMoeBlock(nn.Module):
+    """
+    This implementation is
+    strictly equivalent to standard MoE with full capacity (no
+    dropped tokens). It's faster since it formulates MoE operations
+    in terms of block-sparse operations to accomodate imbalanced
+    assignments of tokens to experts, whereas standard MoE either
+    (1) drop tokens at the cost of reduced performance or (2) set
+    capacity factor to number of experts and thus waste computation
+    and memory on padding.
+    """
 
-        return hidden_states, router_logits
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_dim = config.hidden_size
+        self.ffn_dim = config.intermediate_size
+        self.num_experts = config.num_local_experts
+        self.top_k = config.num_experts_per_tok
+
+        # gating
+        self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
+
+
+        self.moe_mlp = ParallelDroplessMLP(Arguments(
+            hidden_size=self.hidden_dim,
+            ffn_hidden_size=self.ffn_dim,
+            moe_num_experts=self.num_experts,
+            moe_top_k=self.top_k,
+            moe_capacity_factor=1,
+            # init_method=partial(torch.nn.init.normal_, mean=0.0, std=0.1),
+            mlp_type='glu',
+            mlp_impl='sparse',
+            fp16=False,
+            bf16=False,
+            bias=False
+        ))
+
+    def forward(self, hidden_states: torch.Tensor):
+        """ """
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        # router_logits: (batch * sequence_length, n_experts)
+        router_logits = self.gate(hidden_states)
+
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
+        # we cast back to the input dtype
+        routing_weights = routing_weights.to(hidden_states.dtype)
+        final_hidden_states = self.moe_mlp(hidden_states, router_logits, routing_weights,  selected_experts)
+        final_hidden_states = final_hidden_states.view(batch_size, sequence_length, hidden_dim)
+        return final_hidden_states, router_logits
+
 
 class YixtralDecoderLayer(nn.Module):
     def __init__(self, config: YixtralConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = YIXTRAL_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
+        self.self_attn = MISTRAL_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
 
         self.block_sparse_moe = YixtralSparseMoeBlock(config)
         self.input_layernorm = YixtralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -930,7 +860,6 @@ class YixtralPreTrainedModel(PreTrainedModel):
     _no_split_modules = ["YixtralDecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True
-    _supports_sdpa = True
     _supports_cache_class = True
 
     def _init_weights(self, module):
@@ -1034,7 +963,7 @@ class YixtralModel(YixtralPreTrainedModel):
         self.layers = nn.ModuleList(
             [YixtralDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self._attn_implementation = config._attn_implementation
+        self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
         self.norm = YixtralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
@@ -1085,13 +1014,6 @@ class YixtralModel(YixtralPreTrainedModel):
 
         past_key_values_length = 0
 
-        if self.gradient_checkpointing and self.training:
-            if use_cache:
-                logger.warning_once(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                )
-                use_cache = False
-
         if use_cache:
             use_legacy_cache = not isinstance(past_key_values, Cache)
             if use_legacy_cache:
@@ -1110,7 +1032,7 @@ class YixtralModel(YixtralPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        if attention_mask is not None and self._attn_implementation == "flash_attention_2" and use_cache:
+        if attention_mask is not None and self._use_flash_attention_2 and use_cache:
             is_padding_right = attention_mask[:, -1].sum().item() != batch_size
             if is_padding_right:
                 raise ValueError(
@@ -1119,18 +1041,9 @@ class YixtralModel(YixtralPreTrainedModel):
                     " call `tokenizer.padding_side  = 'left'` before tokenizing the input. "
                 )
 
-        if self._attn_implementation == "flash_attention_2":
+        if self._use_flash_attention_2:
             # 2d mask is passed through the layers
             attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
-        elif self._attn_implementation == "sdpa" and not output_attentions:
-            # output_attentions=True can not be supported when using SDPA, and we fall back on
-            # the manual implementation that requires a 4D causal mask in all cases.
-            attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
-                attention_mask,
-                (batch_size, seq_length),
-                inputs_embeds,
-                past_key_values_length,
-            )
         else:
             # 4d mask is passed through the layers
             attention_mask = _prepare_4d_causal_attention_mask(
@@ -1142,6 +1055,13 @@ class YixtralModel(YixtralPreTrainedModel):
             )
 
         hidden_states = inputs_embeds
+
+        if self.gradient_checkpointing and self.training:
+            if use_cache:
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                )
+                use_cache = False
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -1274,8 +1194,8 @@ class YixtralForCausalLM(YixtralPreTrainedModel):
         ```python
         >>> from transformers import AutoTokenizer, YixtralForCausalLM
 
-        >>> model = YixtralForCausalLM.from_pretrained("mistralai/Yixtral-8x7B-v0.1")
-        >>> tokenizer = AutoTokenizer.from_pretrained("mistralai/Yixtral-8x7B-v0.1")
+        >>> model = YixtralForCausalLM.from_pretrained(PATH_TO_CONVERTED_WEIGHTS)
+        >>> tokenizer = AutoTokenizer.from_pretrained(PATH_TO_CONVERTED_TOKENIZER)
 
         >>> prompt = "Hey, are you conscious? Can you talk to me?"
         >>> inputs = tokenizer(prompt, return_tensors="pt")
@@ -1330,13 +1250,10 @@ class YixtralForCausalLM(YixtralPreTrainedModel):
         aux_loss = None
         if output_router_logits:
             aux_loss = load_balancing_loss_func(
-                outputs.router_logits if return_dict else outputs[-1],
-                self.num_experts,
-                self.num_experts_per_tok,
-                attention_mask,
+                outputs.router_logits if return_dict else outputs[-1], self.num_experts, self.num_experts_per_tok
             )
             if labels is not None:
-                loss += self.router_aux_loss_coef * aux_loss.to(loss.device)  # make sure to reside in the same device
+                loss += self.router_aux_loss_coef * aux_loss
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -1355,13 +1272,7 @@ class YixtralForCausalLM(YixtralPreTrainedModel):
         )
 
     def prepare_inputs_for_generation(
-        self,
-        input_ids,
-        past_key_values=None,
-        attention_mask=None,
-        inputs_embeds=None,
-        output_router_logits=False,
-        **kwargs,
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
         # Omit tokens covered by past_key_values
         if past_key_values is not None:
@@ -1375,7 +1286,7 @@ class YixtralForCausalLM(YixtralPreTrainedModel):
 
             # Keep only the unprocessed tokens:
             # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
-            # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as
+            # some of the inputs are exclusivelly passed as part of the cache (e.g. when passing input_embeds as
             # input)
             if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
                 input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
@@ -1413,7 +1324,6 @@ class YixtralForCausalLM(YixtralPreTrainedModel):
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
-                "output_router_logits": output_router_logits,
             }
         )
         return model_inputs
@@ -1507,10 +1417,9 @@ class YixtralForSequenceClassification(YixtralPreTrainedModel):
             sequence_lengths = -1
         else:
             if input_ids is not None:
-                # if no pad token found, use modulo instead of reverse indexing for ONNX compatibility
-                sequence_lengths = torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1
-                sequence_lengths = sequence_lengths % input_ids.shape[-1]
-                sequence_lengths = sequence_lengths.to(logits.device)
+                sequence_lengths = (torch.eq(input_ids, self.config.pad_token_id).int().argmax(-1) - 1).to(
+                    logits.device
+                )
             else:
                 sequence_lengths = -1
 
